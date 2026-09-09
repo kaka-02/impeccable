@@ -162,6 +162,15 @@ describe('generateYamlFrontmatter', () => {
     expect(result).toContain('user-invocable: true');
   });
 
+  test('should generate nested metadata', () => {
+    const result = generateYamlFrontmatter({
+      name: 'test',
+      metadata: { version: '1.2.3' },
+    });
+
+    expect(result).toContain('metadata:\n  version: 1.2.3');
+  });
+
   test('should roundtrip: generate and parse back', () => {
     const original = {
       name: 'roundtrip-test',
@@ -614,7 +623,7 @@ describe('replacePlaceholders', () => {
     expect(result).toBe('STOP and call the AskUserQuestion tool to clarify.');
 
     const cursorResult = replacePlaceholders('{{ask_instruction}}', 'cursor');
-    expect(cursorResult).toBe('ask the user directly to clarify what you cannot infer.');
+    expect(cursorResult).toBe('Ask the user directly to clarify what you cannot infer.');
   });
 
   test('should replace {{available_commands}} with command list', () => {
