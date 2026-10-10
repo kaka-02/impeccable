@@ -46,6 +46,61 @@ function __rectArray(r) {
   return [r.x, r.y, r.width, r.height, r.top, r.right, r.bottom, r.left];
 }
 
+// The client rects of the non-blank text nodes under `node`, in document
+// order. `deep` walks element children too: one line of prose is one line
+// box however the markup splits it, and an inline <strong>, an <a> or a
+// framework marker in the middle of a sentence is a separate text node whose
+// rects belong to the same line. Nothing is merged here — the rects travel as
+// the page gave them and the consumer groups them into lines (see
+// merge_text_rects_into_lines in crates/foundation/src/browser/dom.rs).
+// A descendant whose text is on no line, the same test as renders_no_text in
+// crates/foundation/src/browser/dom.rs: the deep walk skips it so the line
+// rects and the characters line-length divides among them describe the same
+// text. Chrome reports no rects inside a content-visibility: hidden box
+// today; the walk skips it by the shared rule rather than relying on that.
+// content-visibility applies only where layout containment does, so these
+// displays render their text whatever it says (content_visibility_applies).
+const __NO_TEXT_TAGS = new Set(['style', 'script', 'noscript', 'template']);
+const __NO_CONTAINMENT_DISPLAYS = new Set([
+  'inline', 'inline flow', 'contents', 'table-row', 'table-row-group',
+  'table-header-group', 'table-footer-group', 'table-column',
+  'table-column-group', 'ruby', 'ruby-base', 'ruby-text',
+  'ruby-base-container', 'ruby-text-container',
+]);
+function __rendersNoText(el) {
+  if (__NO_TEXT_TAGS.has(String(el.localName || '').toLowerCase())) return true;
+  const cs = getComputedStyle(el);
+  if (cs.display === 'none') return true;
+  return String(cs.contentVisibility || '').toLowerCase() === 'hidden'
+    && !__NO_CONTAINMENT_DISPLAYS.has(String(cs.display || '').toLowerCase().trim());
+}
+function __collectTextRects(node, deep, out) {
+  for (const child of node.childNodes) {
+    if (child.nodeType === 3) {
+      if (!(child.textContent || '').trim()) continue;
+      const range = document.createRange();
+      range.selectNodeContents(child);
+      for (const rect of range.getClientRects()) {
+        if (rect.width >= 1 && rect.height >= 1) out.push(rect);
+      }
+      range.detach?.();
+    } else if (deep && child.nodeType === 1 && !__rendersNoText(child)) {
+      __collectTextRects(child, true, out);
+    }
+  }
+  return out;
+}
+
+// The element's own direct text, unmerged: what the union rect is built from.
+// An HTML <img>, by name rather than `instanceof`, which is false for a
+// node adopted from another realm.
+function __isImg(node) {
+  return !!node && node.localName === 'img' && node.namespaceURI === 'http://www.w3.org/1999/xhtml';
+}
+function __directTextRects(el) {
+  return __collectTextRects(__el(el), false, []);
+}
+
 const __impeccableDom = {
   document_element() { return __intern(document.documentElement); },
   body() { return __intern(document.body); },
@@ -101,6 +156,30 @@ const __impeccableDom = {
     }
     return undefined;
   },
+  // JSON `["0%, 35%", "to", ...]`: the selector of each frame keyframes(name)
+  // returns, in the same order (the same walk, the same frames skipped);
+  // undefined when no rule has that name.
+  keyframe_keys(name) {
+    if (!name) return undefined;
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try { rules = sheet.cssRules || sheet.rules; } catch { continue; }
+      if (!rules) continue;
+      const stack = [...rules];
+      while (stack.length) {
+        const rule = stack.shift();
+        if (rule.cssRules && rule.type !== 7) { stack.push(...rule.cssRules); continue; }
+        if (rule.type !== 7 || rule.name !== name) continue;
+        const keys = [];
+        for (const frame of rule.cssRules || []) {
+          if (!frame.style) continue;
+          keys.push(String(frame.keyText || ''));
+        }
+        return JSON.stringify(keys);
+      }
+    }
+    return undefined;
+  },
   linked_stylesheet_text() {
     // The CSSOM walk lives in 15-snapshot.js so the standalone snapshot
     // producer carries it too; both routes read the same corpus.
@@ -115,6 +194,13 @@ const __impeccableDom = {
   namespace_uri(el) { return __el(el).namespaceURI || ''; },
   parent(el) { return __intern(__el(el).parentElement); },
   children(el) { return __ids_of(__el(el).children); },
+  // The top-level elements of the open shadow tree el hosts; none for a
+  // closed or absent one.
+  shadow_children(el) {
+    let root = null;
+    try { root = __el(el).shadowRoot; } catch { root = null; }
+    return root ? __ids_of(root.children) : [];
+  },
   previous_element_sibling(el) { return __intern(__el(el).previousElementSibling); },
   next_element_sibling(el) { return __intern(__el(el).nextElementSibling); },
   contains(a, b) { return __el(a).contains(__el(b)); },
@@ -148,6 +234,17 @@ const __impeccableDom = {
     }
     return out;
   },
+  // The element children and text nodes of el.childNodes in order: an
+  // element's handle, or 0 for a text node (its data is the matching entry of
+  // direct_text_nodes, which walks the same list).
+  child_node_kinds(el) {
+    const out = [];
+    for (const n of __el(el).childNodes) {
+      if (n.nodeType === 3) out.push(0);
+      else if (n.nodeType === 1) out.push(__intern(n));
+    }
+    return out;
+  },
   is_content_editable(el) { return !!__el(el).isContentEditable; },
   hidden_prop(el) { return !!__el(el).hidden; },
   style(el, prop) {
@@ -171,6 +268,7 @@ const __impeccableDom = {
   client_left(el) { return __el(el).clientLeft; },
   scroll_width(el) { return __el(el).scrollWidth; },
   scroll_left(el) { return __el(el).scrollLeft; },
+  scroll_height(el) { return __el(el).scrollHeight; },
   offset_width(el) { return __el(el).offsetWidth; },
   offset_height(el) { return __el(el).offsetHeight; },
   check_visibility(el) {
@@ -178,25 +276,79 @@ const __impeccableDom = {
     if (typeof node.checkVisibility !== 'function') return -1;
     return node.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true }) ? 1 : 0;
   },
+  // Image load state, for an HTMLImageElement only: [] / -1 / undefined
+  // are "not an image", which the Rust side reads as None.
+  image_natural_size(el) {
+    const node = __el(el);
+    if (!__isImg(node)) return [];
+    return [node.naturalWidth || 0, node.naturalHeight || 0];
+  },
+  image_complete(el) {
+    const node = __el(el);
+    if (!__isImg(node) || typeof node.complete !== 'boolean') return -1;
+    return node.complete ? 1 : 0;
+  },
+  image_current_src(el) {
+    const node = __el(el);
+    if (!__isImg(node)) return undefined;
+    return typeof node.currentSrc === 'string' ? node.currentSrc : '';
+  },
   // getDirectTextRect(el) from the JS driver: union of the client rects of
   // the element's non-blank direct text nodes.
   direct_text_rect(el) {
-    const node = __el(el);
-    const rects = [];
-    for (const child of node.childNodes) {
-      if (child.nodeType !== 3 || !(child.textContent || '').trim()) continue;
-      const range = document.createRange();
-      range.selectNodeContents(child);
-      for (const rect of range.getClientRects()) {
-        if (rect.width >= 1 && rect.height >= 1) rects.push(rect);
-      }
-      range.detach?.();
-    }
+    const rects = __directTextRects(el);
     if (rects.length === 0) return [];
     const left = Math.min(...rects.map(r => r.left));
     const top = Math.min(...rects.map(r => r.top));
     const right = Math.max(...rects.map(r => r.right));
     const bottom = Math.max(...rects.map(r => r.bottom));
     return [left, top, right - left, bottom - top, top, right, bottom, left];
+  },
+  // JSON `["opacity", ...]`: the properties, hyphenated, of every animation
+  // and transition running on the element itself (running or pending, not a
+  // pseudo-element's). The snapshot records the same (15-snapshot.js
+  // __snapRunningAnimations). undefined when the Web Animations API is
+  // missing or throws.
+  running_animation_properties(el) {
+    const node = __el(el);
+    if (typeof node.getAnimations !== 'function') return undefined;
+    let animations;
+    try { animations = node.getAnimations(); } catch { return undefined; }
+    const metadata = new Set(['offset', 'computedOffset', 'easing', 'composite']);
+    const props = [];
+    const add = (property) => {
+      const name = String(property).startsWith('--')
+        ? String(property)
+        : String(property).replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
+      if (name && !props.includes(name)) props.push(name);
+    };
+    for (const animation of animations) {
+      let effect;
+      try {
+        if (animation.playState !== 'running' && !animation.pending) continue;
+        effect = animation.effect;
+      } catch { continue; }
+      if (!effect || effect.pseudoElement || effect.target !== node) continue;
+      if (typeof animation.transitionProperty === 'string') add(animation.transitionProperty);
+      let frames = [];
+      try { frames = effect.getKeyframes?.() || []; } catch { frames = []; }
+      for (const frame of frames) {
+        for (const property of Object.keys(frame)) {
+          if (!metadata.has(property)) add(property);
+        }
+      }
+    }
+    return JSON.stringify(props);
+  },
+  // Every rect of the element's rendered text, descendants included, flattened
+  // into eights. The scope is the element's whole text_content, which is the
+  // text a caller counts characters from; the caller merges the rects that
+  // share a row into the line they rendered on.
+  text_rects(el) {
+    const out = [];
+    for (const r of __collectTextRects(__el(el), true, [])) {
+      out.push(r.left, r.top, r.width, r.height, r.top, r.right, r.bottom, r.left);
+    }
+    return out;
   },
 };

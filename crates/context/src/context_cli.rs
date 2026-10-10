@@ -23,6 +23,7 @@ pub fn hook_manifests_for(provider_id: &str) -> &'static [&'static str] {
         "cursor" => &[".cursor/hooks.json"],
         "github" => &[".github/hooks/impeccable.json"],
         "grok" => &[".grok/hooks/impeccable.json"],
+        "gemini" => &[".gemini/settings.json"],
         _ => &[],
     }
 }
@@ -76,6 +77,11 @@ pub fn automatic_hook_mode(ctx: &Ctx, cwd: &str, env: &Env, provider: &Provider)
     }
     let active_root = jsp::resolve(if ctx.project_root.is_empty() { cwd } else { &ctx.project_root }, &[]);
     if !hook_enabled_at(&active_root, env) {
+        return "none";
+    }
+    // Gemini's manifest carries only the session and build-completion hooks,
+    // no detector pass, so it never counts as automatic coverage.
+    if provider.id == "gemini" {
         return "none";
     }
     let manifests = hook_manifests_for(&provider.id);
@@ -146,7 +152,10 @@ fn read_build_path_at(root: &str) -> Option<(String, String)> {
     found
 }
 
-fn append_build_path_directive(parts: &mut Vec<String>, ctx: &Ctx, cwd: &str) {
+/// The recorded build-path default and the file it came from: projectRoot
+/// (or cwd) then repoRoot, `config.local.json` over `config.json` within a
+/// root, only an exact `comp` / `code` counts, first root with a value wins.
+pub fn recorded_build_path(ctx: &Ctx, cwd: &str) -> Option<(String, String)> {
     let mut roots: Vec<String> = Vec::new();
     for r in [if ctx.project_root.is_empty() { cwd } else { &ctx.project_root }, &ctx.repo_root] {
         if r.is_empty() {
@@ -157,11 +166,12 @@ fn append_build_path_directive(parts: &mut Vec<String>, ctx: &Ctx, cwd: &str) {
             roots.push(a);
         }
     }
-    for root in &roots {
-        if let Some((value, source)) = read_build_path_at(root) {
-            parts.push(format!("BUILD_PATH_DEFAULT: {} (from {}). Author direction and surface rounds with this as buildPath.value and toggle: true; a flip on the page binds that session only and is never written back, because a default is already recorded here. New-work's one-time offer to record a flipped value applies only where no default exists, which is why you are not seeing this line on those projects.", value, source));
-            return;
-        }
+    roots.iter().find_map(|root| read_build_path_at(root))
+}
+
+fn append_build_path_directive(parts: &mut Vec<String>, ctx: &Ctx, cwd: &str) {
+    if let Some((value, source)) = recorded_build_path(ctx, cwd) {
+        parts.push(format!("BUILD_PATH_DEFAULT: {} (from {}). Author Persuade and Experience direction and surface rounds with this as buildPath.value and toggle: true; Operate and Read surfaces are code-led whatever is recorded here, and concept-seed prints the path for each surface. A flip on the page binds that session only and is never written back, because a default is already recorded here. New-work's one-time offer to record a flipped value applies only where no default exists, which is why you are not seeing this line on those projects.", value, source));
     }
 }
 

@@ -5,7 +5,9 @@
 //! (`u32::MAX`, or a first element of `u32::MAX` in arrays) because the probe
 //! catches the DOM's SyntaxError and cannot throw across the boundary.
 
-use impeccable_core::browser::dom::{Dom, ElId, KeyframeFrame, Rect, SelectorError};
+use impeccable_core::browser::dom::{
+    merge_text_rects_into_lines, Dom, DomChild, ElId, KeyframeFrame, Rect, SelectorError,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -27,12 +29,14 @@ extern "C" {
     fn elements_from_point(x: f64, y: f64) -> Vec<u32>;
     fn css_escape(s: &str) -> String;
     fn keyframes(name: &str) -> Option<String>;
+    fn keyframe_keys(name: &str) -> Option<String>;
     fn document_html_for_patterns() -> String;
     fn linked_stylesheet_text() -> String;
     fn tag_name(el: u32) -> String;
     fn namespace_uri(el: u32) -> String;
     fn parent(el: u32) -> u32;
     fn children(el: u32) -> Vec<u32>;
+    fn shadow_children(el: u32) -> Vec<u32>;
     fn previous_element_sibling(el: u32) -> u32;
     fn next_element_sibling(el: u32) -> u32;
     fn contains(a: u32, b: u32) -> bool;
@@ -44,6 +48,7 @@ extern "C" {
     fn text_content(el: u32) -> String;
     fn inner_text(el: u32) -> Option<String>;
     fn direct_text_nodes(el: u32) -> Vec<String>;
+    fn child_node_kinds(el: u32) -> Vec<u32>;
     fn is_content_editable(el: u32) -> bool;
     fn hidden_prop(el: u32) -> bool;
     fn style(el: u32, prop: &str) -> String;
@@ -54,10 +59,16 @@ extern "C" {
     fn client_left(el: u32) -> f64;
     fn scroll_width(el: u32) -> f64;
     fn scroll_left(el: u32) -> f64;
+    fn scroll_height(el: u32) -> f64;
     fn offset_width(el: u32) -> f64;
     fn offset_height(el: u32) -> f64;
     fn check_visibility(el: u32) -> i32;
+    fn image_natural_size(el: u32) -> Vec<f64>;
+    fn image_complete(el: u32) -> i32;
+    fn image_current_src(el: u32) -> Option<String>;
     fn direct_text_rect(el: u32) -> Vec<f64>;
+    fn running_animation_properties(el: u32) -> Option<String>;
+    fn text_rects(el: u32) -> Vec<f64>;
 }
 
 fn opt(id: u32) -> Option<ElId> {
@@ -178,6 +189,9 @@ impl Dom for JsDom {
                 .collect(),
         )
     }
+    fn keyframe_keys(&self, name: &str) -> Option<Vec<String>> {
+        serde_json::from_str(&keyframe_keys(name)?).ok()
+    }
     fn linked_stylesheet_text(&self) -> String {
         linked_stylesheet_text()
     }
@@ -206,11 +220,29 @@ impl Dom for JsDom {
                 .clone()
         })
     }
+    /// The open shadow tree's top-level elements, so a web component that
+    /// lays out its content in its shadow tree is not read as empty. The
+    /// flat tree itself is not composed here (`flat_parent` stays the light
+    /// parent and `shadow_trees_recorded` false).
+    fn shadow_children(&self, el: ElId) -> Vec<ElId> {
+        shadow_children(el)
+    }
     fn previous_element_sibling(&self, el: ElId) -> Option<ElId> {
         opt(previous_element_sibling(el))
     }
     fn next_element_sibling(&self, el: ElId) -> Option<ElId> {
         opt(next_element_sibling(el))
+    }
+    fn first_element_child(&self, el: ElId) -> Option<ElId> {
+        // One bridge call per element per scan, then read from the cache
+        // without cloning the list.
+        CHILDREN_CACHE.with(|c| {
+            c.borrow_mut()
+                .entry(el)
+                .or_insert_with(|| children(el))
+                .first()
+                .copied()
+        })
     }
     fn contains(&self, a: ElId, b: ElId) -> bool {
         contains(a, b)
@@ -271,6 +303,22 @@ impl Dom for JsDom {
                 .clone()
         })
     }
+    /// The probe gives the order (a handle, or 0 for a text node) and the
+    /// text nodes come from `direct_text_nodes`, which walks the same
+    /// `childNodes` list, so the n-th 0 is the n-th text node.
+    fn child_nodes(&self, el: ElId) -> Vec<DomChild> {
+        let mut texts = self.direct_text_nodes(el).into_iter();
+        child_node_kinds(el)
+            .into_iter()
+            .filter_map(|id| {
+                if id == 0 {
+                    texts.next().map(DomChild::Text)
+                } else {
+                    Some(DomChild::Element(id))
+                }
+            })
+            .collect()
+    }
     fn is_content_editable(&self, el: ElId) -> bool {
         is_content_editable(el)
     }
@@ -319,11 +367,17 @@ impl Dom for JsDom {
     fn scroll_left(&self, el: ElId) -> f64 {
         scroll_left(el)
     }
+    fn scroll_height(&self, el: ElId) -> f64 {
+        scroll_height(el)
+    }
     fn offset_width(&self, el: ElId) -> f64 {
         offset_width(el)
     }
     fn offset_height(&self, el: ElId) -> f64 {
         offset_height(el)
+    }
+    fn running_animation_properties(&self, el: ElId) -> Option<Vec<String>> {
+        serde_json::from_str(&running_animation_properties(el)?).ok()
     }
     fn check_visibility(&self, el: ElId) -> Option<bool> {
         match check_visibility(el) {
@@ -332,6 +386,22 @@ impl Dom for JsDom {
             _ => None,
         }
     }
+    fn image_natural_size(&self, el: ElId) -> Option<(f64, f64)> {
+        match image_natural_size(el)[..] {
+            [w, h] => Some((w, h)),
+            _ => None,
+        }
+    }
+    fn image_complete(&self, el: ElId) -> Option<bool> {
+        match image_complete(el) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+    fn image_current_src(&self, el: ElId) -> Option<String> {
+        image_current_src(el)
+    }
     fn direct_text_rect(&self, el: ElId) -> Option<Rect> {
         let v = direct_text_rect(el);
         if v.len() < 8 {
@@ -339,5 +409,15 @@ impl Dom for JsDom {
         } else {
             Some(to_rect(&v))
         }
+    }
+    /// A live page can always say where its lines are. The probe flattens the
+    /// rects of every text node under the element into one array of eights, in
+    /// the order `rect` uses (a tail shorter than a rect is ignored), and the
+    /// fragments that share a row are merged back into the line they came
+    /// from here.
+    fn text_line_rects(&self, el: ElId) -> Option<Vec<Rect>> {
+        Some(merge_text_rects_into_lines(
+            text_rects(el).chunks_exact(8).map(to_rect).collect(),
+        ))
     }
 }
